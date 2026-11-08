@@ -1,0 +1,108 @@
+-- Icewind Dale II 日本語化（IWD2JP）: IEex の上で動く手直し
+-- M__IEex.lua から IEex_IWD2_Patch.lua の後に読み込まれる。
+
+---------------------------------------------------------------------------
+-- 1. lua の文字列検索のパターンの手直し
+--   IWD2EE の lua は dialog.tlk の文（「ダメージ」など）を string.match などのパターンに使う。
+--   Shift_JIS の 2 バイト目には [ ] ^ が来ることがあり（例: 「ー」= 81 5B）、パターンの記号と
+--   取り違えられて「malformed pattern」になる。漢字・かなの 2 バイト目に来た記号だけを % で逃がす。
+---------------------------------------------------------------------------
+(function()
+
+	local s_match, s_find, s_gsub, s_gmatch = string.match, string.find, string.gsub, string.gmatch
+	local magic = {}
+	for _, c in ipairs({"^", "$", "(", ")", "%", ".", "[", "]", "*", "+", "-", "?"}) do
+		magic[c:byte()] = true
+	end
+
+	local function fixpat(p)
+		if type(p) ~= "string" or not s_find(p, "[\128-\255]") then
+			return p
+		end
+		local out, i, n = {}, 1, #p
+		while i <= n do
+			local b = p:byte(i)
+			if ((b >= 0x81 and b <= 0x9F) or (b >= 0xE0 and b <= 0xFC)) and i < n then
+				local t = p:byte(i + 1)
+				out[#out + 1] = string.char(b)
+				if magic[t] then
+					out[#out + 1] = "%"
+				end
+				out[#out + 1] = string.char(t)
+				i = i + 2
+			else
+				out[#out + 1] = string.char(b)
+				i = i + 1
+			end
+		end
+		return table.concat(out)
+	end
+
+	string.match = function(s, p, ...)
+		return s_match(s, fixpat(p), ...)
+	end
+	string.find = function(s, p, init, plain)
+		if plain then
+			return s_find(s, p, init, plain)
+		end
+		return s_find(s, fixpat(p), init)
+	end
+	string.gsub = function(s, p, r, n)
+		return s_gsub(s, fixpat(p), r, n)
+	end
+	string.gmatch = function(s, p)
+		return s_gmatch(s, fixpat(p))
+	end
+
+	print("IWD2JP: lua pattern fix installed")
+
+end)();
+
+---------------------------------------------------------------------------
+-- 2. 行頭・行末禁則
+--   CUtil_SplitString（0x780CF0）が、空白の無いところで行を折る位置（edi）を決めた直後（0x780F54）に
+--   割り込み、折る位置を禁則に合うように前へずらす。ずらす処理は C で書いた機械語（他の番地を参照しない）。
+--     int __cdecl kinsoku(const unsigned char *s, int len, int brk)
+--   0x780F54 の元の命令: 8B 81 A0 01 00 00  mov eax, [ecx+0x1A0]（IEex_HookRestore が後ろに戻す）
+---------------------------------------------------------------------------
+(function()
+
+	-- 差し替える場所が想定どおりの命令か確かめる（IWD2.exe が違う版なら何もしない）
+	if IEex_ReadDword(0x780F54) ~= 0x01A0818B or IEex_ReadByte(0x780F58, 0) ~= 0x00 then
+		print("IWD2JP: kinsoku patch skipped (unexpected code at 0x780F54)")
+		return
+	end
+
+	local hex = [[
+@@HEX@@
+	]]
+
+	local code = {}
+	for h in hex:gmatch("%x%x") do
+		table.insert(code, {tonumber(h, 16), 1})
+	end
+
+	IEex_DisableCodeProtection()
+
+	local kinsoku = IEex_WriteAssemblyAuto(code)
+
+	-- esi = 今の行の CString へのポインタ、edi = 折る位置。ecx・edx は後で使われるので守る
+	IEex_HookRestore(0x780F54, 0, 6, {[[
+		51
+		52
+		8B 06
+		57
+		FF 70 F8
+		50
+		E8 ]], {kinsoku, 4, 4}, [[
+		83 C4 0C
+		8B F8
+		5A
+		59
+	]]})
+
+	IEex_EnableCodeProtection()
+
+	print("IWD2JP: kinsoku patch installed")
+
+end)();
