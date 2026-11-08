@@ -17,7 +17,9 @@
 typedef unsigned long long u64;
 typedef unsigned int u32;
 
-static char dir[MAX_PATH], bakdir[MAX_PATH];
+/* dir: いま処理しているフォルダ（ゲームのフォルダ、または VirtualStore の写し）
+ * exedir: この exe と IWD2JP.dat・IWD2JP.lua があるフォルダ */
+static char dir[MAX_PATH], bakdir[MAX_PATH], exedir[MAX_PATH];
 
 static u64 fnv(const unsigned char *p, u32 n)
 {
@@ -50,10 +52,17 @@ static int save(const char *path, const void *p, size_t n)
     char tmp[MAX_PATH];
     sprintf(tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "wb");
+    if (f) {
+        size_t w = fwrite(p, 1, n, f);
+        fclose(f);
+        if (w == n && MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) return 1;
+        DeleteFileA(tmp);
+    }
+    /* 置き換えできないとき（振り替えの下など）は直接書く */
+    f = fopen(path, "wb");
     if (!f) return 0;
-    fwrite(p, 1, n, f);
-    fclose(f);
-    return MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING);
+    size_t w = fwrite(p, 1, n, f);
+    return fclose(f) == 0 && w == n;
 }
 
 static void finish(int code)
@@ -127,6 +136,7 @@ static void do_tlk(void)
 {
     char tlk[MAX_PATH];
     sprintf(tlk, "%s\\dialog.tlk", dir);
+    if (GetFileAttributesA(tlk) == INVALID_FILE_ATTRIBUTES) return;   /* VirtualStore の写しに無いときなど */
     u32 tsize;
     unsigned char *t = load(tlk, &tsize);
     if (!t || tsize < 18 || memcmp(t, "TLK V1  ", 8)) { printf("dialog.tlk を読めません。\n"); finish(1); }
@@ -291,9 +301,10 @@ static void do_ieex(void)
     char mpath[MAX_PATH], tpath[MAX_PATH], lsrc[MAX_PATH], ldst[MAX_PATH];
     sprintf(mpath, "%s\\override\\M__IEex.lua", dir);
     sprintf(tpath, "%s\\override\\IEex_TRA.lua", dir);
-    sprintf(lsrc, "%s\\IWD2JP.lua", dir);
+    sprintf(lsrc, "%s\\IWD2JP.lua", exedir);
     sprintf(ldst, "%s\\override\\IWD2JP.lua", dir);
-    if (GetFileAttributesA(mpath) == INVALID_FILE_ATTRIBUTES) return;   /* IWD2EE が無い */
+    if (GetFileAttributesA(mpath) == INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesA(tpath) == INVALID_FILE_ATTRIBUTES) return;   /* IWD2EE が無い */
 
     /* IEex_TRA.lua: 名前 = "英文" の行を訳す */
     u32 n, hit = 0;
@@ -350,6 +361,10 @@ static void do_ieex(void)
     }
 
     /* IWD2JP.lua を override に置き、M__IEex.lua に読み込みの行を足す */
+    if (GetFileAttributesA(mpath) == INVALID_FILE_ATTRIBUTES) {
+        printf("IWD2EE: 画面の文 %u 件を日本語にしました。\n", hit);
+        return;
+    }
     int lua_ok = GetFileAttributesA(lsrc) != INVALID_FILE_ATTRIBUTES && CopyFileA(lsrc, ldst, FALSE);
     int hooked = 0;
     unsigned char *mb = load(mpath, &n);
@@ -380,11 +395,11 @@ static void do_ieex(void)
     printf(hooked ? "禁則と文字の手直し（IWD2JP.lua）を組み込みました。\n" : "禁則の手直しは組み込めませんでした。\n");
 }
 
-static void do_restore(void)
+static int do_restore(void)
 {
     char ini[MAX_PATH], pat[MAX_PATH];
     sprintf(ini, "%s\\icewind2.ini", dir);
-    if (GetFileAttributesA(bakdir) == INVALID_FILE_ATTRIBUTES) { printf("控え（IWD2JP_backup フォルダ）がありません。\n"); finish(1); }
+    if (GetFileAttributesA(bakdir) == INVALID_FILE_ATTRIBUTES) return -1;
     int n = 0;
     n += restore_one("dialog.tlk");
     n += restore_one("Party.ini");
@@ -407,29 +422,95 @@ static void do_restore(void)
         } while (FindNextFileA(h, &fd));
         FindClose(h);
     }
-    WritePrivateProfileStringA("Program Options", "Double Byte Character Support", "0", ini);
-    WritePrivateProfileStringA("Program Options", "Font Name", "", ini);
-    printf("%d 個のファイルを英語に戻しました。\n", n);
-    printf("（IWD2EE の部品を入れ直した後に戻すと、その分の文は失われます。そのときは IWD2EE を入れ直してください。）\n");
-    finish(0);
+    if (GetFileAttributesA(ini) != INVALID_FILE_ATTRIBUTES) {
+        WritePrivateProfileStringA("Program Options", "Double Byte Character Support", "0", ini);
+        WritePrivateProfileStringA("Program Options", "Font Name", "", ini);
+    }
+    return n;
+}
+
+/* ---- Windows のファイルの振り替え（VirtualStore） ----
+ * IWD2.exe は manifest を持たないので、Program Files の下では書き込みが
+ *   %LOCALAPPDATA%\VirtualStore\<ゲームのフォルダ（ドライブ名を除く）>
+ * に振り替えられ、以後そちらの写し（ゲームが終了時に書く Icewind2.ini など）が読まれる。
+ * この exe も manifest を持たないので、ふつうに実行すればゲームと同じ振り替えを受ける。
+ * 管理者として実行されたとき（振り替えが効いていないとき）は、写しがあればそちらも処理する。 */
+static int virtualized(void)
+{
+    HANDLE tok;
+    DWORD v = 0, len = 0;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return 0;
+    if (!GetTokenInformation(tok, TokenVirtualizationEnabled, &v, sizeof(v), &len)) v = 0;
+    CloseHandle(tok);
+    return v != 0;
+}
+
+static int vstore_dir(char *out)
+{
+    char la[MAX_PATH];
+    DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", la, MAX_PATH);
+    if (!n || n >= MAX_PATH || strlen(exedir) < 3 || exedir[1] != ':') return 0;
+    sprintf(out, "%s\\VirtualStore%s", la, exedir + 2);
+    DWORD a = GetFileAttributesA(out);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static void set_dir(const char *d)
+{
+    strcpy(dir, d);
+    sprintf(bakdir, "%s\\IWD2JP_backup", dir);
+}
+
+static void write_ini(int must)
+{
+    char ini[MAX_PATH];
+    sprintf(ini, "%s\\icewind2.ini", dir);
+    if (!must && GetFileAttributesA(ini) == INVALID_FILE_ATTRIBUTES) return;
+    if (WritePrivateProfileStringA("Program Options", "Double Byte Character Support", "1", ini) &&
+        WritePrivateProfileStringA("Program Options", "Font Name", "MS Gothic", ini))
+        printf("icewind2.ini に日本語表示の設定を書きました。\n");
+    else
+        printf("icewind2.ini に設定を書けませんでした。\n");
 }
 
 int main(int argc, char **argv)
 {
-    char tlk[MAX_PATH], ini[MAX_PATH], datp[MAX_PATH];
-    GetModuleFileNameA(NULL, dir, MAX_PATH);
-    *strrchr(dir, '\\') = 0;
-    sprintf(bakdir, "%s\\IWD2JP_backup", dir);
-    sprintf(tlk, "%s\\dialog.tlk", dir);
-    sprintf(ini, "%s\\icewind2.ini", dir);
-    sprintf(datp, "%s\\IWD2JP.dat", dir);
+    char tlk[MAX_PATH], datp[MAX_PATH], vs[MAX_PATH];
+    GetModuleFileNameA(NULL, exedir, MAX_PATH);
+    *strrchr(exedir, '\\') = 0;
+    set_dir(exedir);
+    sprintf(tlk, "%s\\dialog.tlk", exedir);
+    sprintf(datp, "%s\\IWD2JP.dat", exedir);
+    int virt = virtualized();
+    if (GetEnvironmentVariableA("IWD2JP_TEST_NOVIRT", vs, MAX_PATH)) virt = 0;   /* 試験用: 管理者で実行されたときの動きを試す */
+    int has_vs = !virt && vstore_dir(vs);
 
     printf("Icewind Dale II 日本語化\n\n");
     if (GetFileAttributesA(tlk) == INVALID_FILE_ATTRIBUTES) {
         printf("dialog.tlk が見つかりません。この exe を Icewind Dale II のフォルダに置いて実行してください。\n");
         finish(1);
     }
-    if (argc > 1 && _stricmp(argv[1], "/restore") == 0) do_restore();
+    if (argc > 1 && _stricmp(argv[1], "/restore") == 0) {
+        int n = do_restore();
+        if (has_vs) {
+            set_dir(vs);
+            int m = do_restore();
+            if (m > 0) n = (n > 0 ? n : 0) + m;
+            else {
+                /* 写しに控えが無くても、写しの ini があれば日本語表示の設定は外す */
+                char ini[MAX_PATH];
+                sprintf(ini, "%s\\icewind2.ini", dir);
+                if (GetFileAttributesA(ini) != INVALID_FILE_ATTRIBUTES) {
+                    WritePrivateProfileStringA("Program Options", "Double Byte Character Support", "0", ini);
+                    WritePrivateProfileStringA("Program Options", "Font Name", "", ini);
+                }
+            }
+        }
+        if (n < 0) { printf("控え（IWD2JP_backup フォルダ）がありません。\n"); finish(1); }
+        printf("%d 個のファイルを英語に戻しました。\n", n);
+        printf("（IWD2EE の部品を入れ直した後に戻すと、その分の文は失われます。そのときは IWD2EE を入れ直してください。）\n");
+        finish(0);
+    }
 
     u32 dsize;
     unsigned char *dat = load(datp, &dsize);
@@ -451,10 +532,19 @@ int main(int argc, char **argv)
     do_party();
     do_chars();
     do_ieex();
+    write_ini(1);
 
-    WritePrivateProfileStringA("Program Options", "Double Byte Character Support", "1", ini);
-    WritePrivateProfileStringA("Program Options", "Font Name", "MS Gothic", ini);
-    printf("icewind2.ini に日本語表示の設定を書きました。\n");
+    if (has_vs) {
+        /* 管理者として実行されたとき: ゲームが実際に読む VirtualStore の写しも日本語にする */
+        printf("\nWindows が振り替えたゲームのファイルの写し（%s）も直します。\n", vs);
+        set_dir(vs);
+        do_tlk();
+        do_party();
+        do_chars();
+        do_ieex();
+        write_ini(0);
+    }
+
     printf("元のファイルは IWD2JP_backup フォルダに控えてあります（/restore で戻せます）。\n");
     printf("\nIWD2EE.exe からゲームを起動してください。\n");
     printf("IWD2EE の部品を入れ直したときは、もう一度この exe を実行してください。\n");
