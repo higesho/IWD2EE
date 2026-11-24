@@ -482,7 +482,10 @@ int main(int argc, char **argv)
     sprintf(tlk, "%s\\dialog.tlk", exedir);
     sprintf(datp, "%s\\IWD2JP.dat", exedir);
     int virt = virtualized();
-    if (GetEnvironmentVariableA("IWD2JP_TEST_NOVIRT", vs, MAX_PATH)) virt = 0;   /* 試験用: 管理者で実行されたときの動きを試す */
+#ifdef IWD2JP_TEST
+    /* 試験版だけ: 管理者で実行されたときの動きを試す（配布版には入れない） */
+    if (GetEnvironmentVariableA("IWD2JP_TEST_NOVIRT", vs, MAX_PATH)) virt = 0;
+#endif
     int has_vs = !virt && vstore_dir(vs);
 
     printf("Icewind Dale II 日本語化\n\n");
